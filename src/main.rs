@@ -151,7 +151,6 @@ fn get_boundaries(path: &Path) -> Result<Boundaries, Error> {
         let size = sect.size();
 
         if start + total_size == address {
-            start = address;
             total_size += size;
         } else {
             // not a contiguous section

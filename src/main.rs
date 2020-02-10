@@ -6,9 +6,9 @@ use std::{
     process::Command,
 };
 
-use anyhow::{anyhow, bail, Error};
+use anyhow::{anyhow, Error};
+use goblin::elf::Elf;
 use walkdir::WalkDir;
-use xmas_elf::{sections::SectionData, symbol_table::Entry, ElfFile};
 
 fn main() -> Result<(), Error> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
@@ -104,39 +104,38 @@ struct Boundaries {
 //
 // this assumes that either a .bss or a .data section exists in the ELF
 fn get_boundaries(path: &Path) -> Result<Boundaries, Error> {
-    // Allocatable linker section
-    const SHF_ALLOC: u64 = 0x2;
-
     let bytes = &fs::read(path)?;
-    let elf = &ElfFile::new(bytes).map_err(|s| anyhow!("{}", s))?;
+    let mut elf = Elf::parse(bytes)?;
 
     // sections that will be allocated in device memory
-    let mut sections = elf
-        .section_iter()
-        .filter(|sect| sect.flags() & SHF_ALLOC == SHF_ALLOC)
-        .collect::<Vec<_>>();
-    sections.sort_by_key(|sect| sect.address());
+    elf.section_headers.sort_by_key(|sect| sect.sh_addr);
+    let sections = &elf.section_headers;
 
     // the index of either `.bss` or `.data`
     let index = sections
         .iter()
         .position(|sect| {
-            sect.get_name(elf)
-                .map(|name| name == ".bss" || name == ".data")
-                .unwrap_or(false)
+            let name = elf.shdr_strtab.get(sect.sh_name).and_then(|res| res.ok());
+            name == Some(".bss") || name == Some(".data")
         })
         .ok_or_else(|| anyhow!("linker sections `.bss` and `.data` not found"))?;
 
-    let mut start = sections[index].address();
-    let mut total_size = sections[index].size();
+    let sect = &sections[index];
+    let align = sections
+        .iter()
+        .map(|sect| sect.sh_addralign)
+        .max()
+        .unwrap_or(1);
+    let mut start = sect.sh_addr;
+    let mut total_size = sect.sh_size;
 
     // merge contiguous sections
     // first, grow backwards (towards smaller addresses)
     for sect in sections[..index].iter().rev() {
-        let address = sect.address();
-        let size = sect.size();
+        let address = sect.sh_addr;
+        let size = sect.sh_size;
 
-        if address + size == start {
+        if address + size <= start && start - (address + size) <= align {
             start = address;
             total_size += size;
         } else {
@@ -147,10 +146,10 @@ fn get_boundaries(path: &Path) -> Result<Boundaries, Error> {
 
     // then, grow forwards (towards bigger addresses)
     for sect in sections[index..].iter().skip(1) {
-        let address = sect.address();
-        let size = sect.size();
+        let address = sect.sh_addr;
+        let size = sect.sh_size;
 
-        if start + total_size == address {
+        if start + total_size <= address && address - (start + total_size) <= align {
             total_size += size;
         } else {
             // not a contiguous section
@@ -158,37 +157,18 @@ fn get_boundaries(path: &Path) -> Result<Boundaries, Error> {
         }
     }
 
-    let maybe_stack_top = match elf
-        .find_section_by_name(".symtab")
-        .ok_or_else(|| anyhow!("`.symtab` section not found"))?
-        .get_data(elf)
-    {
-        Ok(SectionData::SymbolTable32(entries)) => entries
-            .iter()
-            .filter_map(|entry| {
-                if entry.get_name(elf) == Ok("__stack_top__") {
-                    Some(entry.value())
-                } else {
-                    None
-                }
-            })
-            .next(),
-
-        Ok(SectionData::SymbolTable64(entries)) => entries
-            .iter()
-            .filter_map(|entry| {
-                if entry.get_name(elf) == Ok("__stack_top__") {
-                    Some(entry.value())
-                } else {
-                    None
-                }
-            })
-            .next(),
-
-        _ => bail!("`.symtab` data has the wrong format"),
-    };
-
-    let stack_top = maybe_stack_top.ok_or_else(|| anyhow!("symbol `__stack_top__` not found"))?;
+    let stack_top = elf
+        .syms
+        .iter()
+        .filter_map(|sym| {
+            if elf.strtab.get(sym.st_name).and_then(|res| res.ok()) == Some("__stack_top__") {
+                Some(sym.st_value)
+            } else {
+                None
+            }
+        })
+        .next()
+        .ok_or_else(|| anyhow!("symbol `__stack_top__` not found"))?;
 
     Ok(Boundaries {
         address: start,

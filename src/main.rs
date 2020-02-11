@@ -121,6 +121,9 @@ fn get_boundaries(path: &Path) -> Result<Boundaries, Error> {
         .ok_or_else(|| anyhow!("linker sections `.bss` and `.data` not found"))?;
 
     let sect = &sections[index];
+    // FIXME this is an over-estimate. When merging sections we should only
+    // consider the alignment of the two potentially contiguous sections rather
+    // than the maximum alignment among all of them
     let align = sections
         .iter()
         .map(|sect| sect.sh_addralign)

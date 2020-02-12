@@ -1,14 +1,15 @@
 #![deny(warnings)]
 
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     process::Command,
 };
 
-use anyhow::{anyhow, bail, Error};
+use anyhow::{anyhow, Error};
+use goblin::elf::Elf;
 use walkdir::WalkDir;
-use xmas_elf::{sections::SectionData, symbol_table::Entry, ElfFile};
 
 fn main() -> Result<(), Error> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
@@ -20,15 +21,22 @@ fn main() -> Result<(), Error> {
     }
 
     // retrieve the output file name
-    let output = &get_o_value(&args)?;
+    let output = &get_o_value(&args)?.to_owned();
     let Boundaries {
+        max_align,
+        mut merged_sections,
         stack_top,
         address,
         size,
-    } = get_boundaries(output)?;
+    } = get_boundaries(&output)?;
 
     if stack_top > address + size {
         let mut new_boundary = stack_top - size;
+        // account for sections shifting around to meet their alignment under
+        // the new starting address
+        // FIXME this is an over-estimate. For each boundary we should consider
+        // the alignments of the two neighboring sections
+        new_boundary -= merged_sections.len() as u64 * max_align;
 
         // 8-byte align the new boundary; most architectures need the stack to
         // be 4-byte or 8-byte aligned
@@ -45,6 +53,48 @@ fn main() -> Result<(), Error> {
         c.args(&args);
         if !c.status()?.success() {
             return Err(anyhow!("second `rust-lld` invocation failed"));
+        }
+
+        // now do a sanity check
+        let bytes = &fs::read(output)?;
+        let elf = Elf::parse(bytes)?;
+        let mut failed = false;
+        // all sections must
+        // - start at an address higher than `new_boundary`; this ensures the
+        // stack won't collide into them
+        // - end at an address lower or equal to the initial `stack_top`, as
+        // this is likely the boundary of the RAM region
+        for sh in elf.section_headers {
+            if failed {
+                break;
+            }
+
+            if let Some(name) = elf.shdr_strtab.get(sh.sh_name).and_then(|res| res.ok()) {
+                if merged_sections.remove(name) {
+                    let start = sh.sh_addr;
+                    let end = start + sh.sh_size;
+
+                    if start < new_boundary || end > stack_top {
+                        failed = true;
+                    }
+                }
+
+                // todo remove
+                if failed {
+                    panic!("{}", name);
+                }
+            }
+        }
+
+        if !merged_sections.is_empty() {
+            failed = true;
+        }
+
+        if failed {
+            // TODO remove the file because it's invalid
+            // let _ = fs::remove_file(output);
+
+            return Err(anyhow!("We are sorry. We couldn't make the linker do as we intended. Please file a bug report with steps to build this program so we can do better."));
         }
     }
 
@@ -93,6 +143,8 @@ fn get_o_value(args: &[String]) -> Result<&Path, Error> {
 
 /// Boundaries of the statically allocated memory
 struct Boundaries {
+    max_align: u64,
+    merged_sections: HashSet<String>,
     address: u64,
     size: u64,
     // the originally chosen top of the stack
@@ -104,39 +156,52 @@ struct Boundaries {
 //
 // this assumes that either a .bss or a .data section exists in the ELF
 fn get_boundaries(path: &Path) -> Result<Boundaries, Error> {
-    // Allocatable linker section
-    const SHF_ALLOC: u64 = 0x2;
-
     let bytes = &fs::read(path)?;
-    let elf = &ElfFile::new(bytes).map_err(|s| anyhow!("{}", s))?;
+    let mut elf = Elf::parse(bytes)?;
 
     // sections that will be allocated in device memory
-    let mut sections = elf
-        .section_iter()
-        .filter(|sect| sect.flags() & SHF_ALLOC == SHF_ALLOC)
-        .collect::<Vec<_>>();
-    sections.sort_by_key(|sect| sect.address());
+    elf.section_headers.sort_by_key(|sect| sect.sh_addr);
+    let sections = &elf.section_headers;
 
     // the index of either `.bss` or `.data`
+    let mut merged_sections = HashSet::new();
     let index = sections
         .iter()
         .position(|sect| {
-            sect.get_name(elf)
-                .map(|name| name == ".bss" || name == ".data")
-                .unwrap_or(false)
+            let name = elf.shdr_strtab.get(sect.sh_name).and_then(|res| res.ok());
+            let bss_or_data = name == Some(".bss") || name == Some(".data");
+            if bss_or_data {
+                merged_sections.insert(name.unwrap().to_owned());
+            }
+            bss_or_data
         })
         .ok_or_else(|| anyhow!("linker sections `.bss` and `.data` not found"))?;
 
-    let mut start = sections[index].address();
-    let mut total_size = sections[index].size();
+    let sect = &sections[index];
+    // FIXME this is an over-estimate. When merging sections we should only
+    // consider the alignment of the two potentially contiguous sections rather
+    // than the maximum alignment among all of them
+    let max_align = sections
+        .iter()
+        .map(|sect| sect.sh_addralign)
+        .max()
+        .unwrap_or(1);
+    let mut start = sect.sh_addr;
+    let mut total_size = sect.sh_size;
 
     // merge contiguous sections
     // first, grow backwards (towards smaller addresses)
     for sect in sections[..index].iter().rev() {
-        let address = sect.address();
-        let size = sect.size();
+        let address = sect.sh_addr;
+        let size = sect.sh_size;
 
-        if address + size == start {
+        if address + size <= start && start - (address + size) <= max_align {
+            let name = elf
+                .shdr_strtab
+                .get(sect.sh_name)
+                .and_then(|res| res.ok())
+                .ok_or_else(|| anyhow!("no name information for section {}", sect.sh_name))?;
+            merged_sections.insert(name.to_owned());
             start = address;
             total_size += size;
         } else {
@@ -147,11 +212,16 @@ fn get_boundaries(path: &Path) -> Result<Boundaries, Error> {
 
     // then, grow forwards (towards bigger addresses)
     for sect in sections[index..].iter().skip(1) {
-        let address = sect.address();
-        let size = sect.size();
+        let address = sect.sh_addr;
+        let size = sect.sh_size;
 
-        if start + total_size == address {
-            start = address;
+        if start + total_size <= address && address - (start + total_size) <= max_align {
+            let name = elf
+                .shdr_strtab
+                .get(sect.sh_name)
+                .and_then(|res| res.ok())
+                .ok_or_else(|| anyhow!("no name information for section {}", sect.sh_name))?;
+            merged_sections.insert(name.to_owned());
             total_size += size;
         } else {
             // not a contiguous section
@@ -159,40 +229,23 @@ fn get_boundaries(path: &Path) -> Result<Boundaries, Error> {
         }
     }
 
-    let maybe_stack_top = match elf
-        .find_section_by_name(".symtab")
-        .ok_or_else(|| anyhow!("`.symtab` section not found"))?
-        .get_data(elf)
-    {
-        Ok(SectionData::SymbolTable32(entries)) => entries
-            .iter()
-            .filter_map(|entry| {
-                if entry.get_name(elf) == Ok("__stack_top__") {
-                    Some(entry.value())
-                } else {
-                    None
-                }
-            })
-            .next(),
-
-        Ok(SectionData::SymbolTable64(entries)) => entries
-            .iter()
-            .filter_map(|entry| {
-                if entry.get_name(elf) == Ok("__stack_top__") {
-                    Some(entry.value())
-                } else {
-                    None
-                }
-            })
-            .next(),
-
-        _ => bail!("`.symtab` data has the wrong format"),
-    };
-
-    let stack_top = maybe_stack_top.ok_or_else(|| anyhow!("symbol `__stack_top__` not found"))?;
+    let stack_top = elf
+        .syms
+        .iter()
+        .filter_map(|sym| {
+            if elf.strtab.get(sym.st_name).and_then(|res| res.ok()) == Some("__stack_top__") {
+                Some(sym.st_value)
+            } else {
+                None
+            }
+        })
+        .next()
+        .ok_or_else(|| anyhow!("symbol `__stack_top__` not found"))?;
 
     Ok(Boundaries {
+        max_align,
         address: start,
+        merged_sections,
         size: total_size,
         stack_top,
     })

@@ -23,7 +23,7 @@ fn main() -> Result<(), Error> {
     // retrieve the output file name
     let output = &get_o_value(&args)?.to_owned();
     let Boundaries {
-        mut merged_sections,
+        merged_sections,
         stack_top,
         address,
         size,
@@ -33,6 +33,8 @@ fn main() -> Result<(), Error> {
     let mut new_boundary = stack_top - size;
     // TODO we may want to upper bound the number of iterations this loop does?
     'link: while !ok {
+        let mut merged_sections = merged_sections.clone();
+
         // 8-byte align the new boundary; most architectures need the stack to
         // be 4-byte or 8-byte aligned
         let rem = new_boundary % 8;

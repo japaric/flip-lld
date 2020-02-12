@@ -12,7 +12,7 @@ use goblin::elf::Elf;
 use walkdir::WalkDir;
 
 fn main() -> Result<(), Error> {
-    let mut args = env::args().skip(1).collect::<Vec<_>>();
+    let args = env::args().skip(1).collect::<Vec<_>>();
     let rust_lld = rust_lld()?;
 
     // run the linker exactly as `rustc` instructed
@@ -23,34 +23,31 @@ fn main() -> Result<(), Error> {
     // retrieve the output file name
     let output = &get_o_value(&args)?.to_owned();
     let Boundaries {
-        max_align,
         mut merged_sections,
         stack_top,
         address,
         size,
     } = get_boundaries(&output)?;
 
-    if stack_top > address + size {
-        let mut new_boundary = stack_top - size;
-        // account for sections shifting around to meet their alignment under
-        // the new starting address
-        // FIXME this is an over-estimate. For each boundary we should consider
-        // the alignments of the two neighboring sections
-        new_boundary -= merged_sections.len() as u64 * max_align;
-
+    let mut ok = stack_top <= address + size;
+    let mut new_boundary = stack_top - size;
+    // TODO we may want to upper bound the number of iterations this loop does?
+    'link: while !ok {
         // 8-byte align the new boundary; most architectures need the stack to
         // be 4-byte or 8-byte aligned
         let rem = new_boundary % 8;
         if rem != 0 {
             new_boundary -= rem;
         }
+
         // swap the location of the stack and the statically allocated data so
         // they can't run into each other
-        args.insert(2, format!("--defsym=__ram_start__={}", new_boundary));
-        args.insert(2, format!("--defsym=__stack_top__={}", new_boundary));
+        let mut new_args = args.clone();
+        new_args.insert(2, format!("--defsym=__ram_start__={}", new_boundary));
+        new_args.insert(2, format!("--defsym=__stack_top__={}", new_boundary));
 
         let mut c = Command::new(&rust_lld);
-        c.args(&args);
+        c.args(&new_args);
         if !c.status()?.success() {
             return Err(anyhow!("second `rust-lld` invocation failed"));
         }
@@ -58,43 +55,52 @@ fn main() -> Result<(), Error> {
         // now do a sanity check
         let bytes = &fs::read(output)?;
         let elf = Elf::parse(bytes)?;
-        let mut failed = false;
+        let mut fatal_error = false;
+        ok = true;
+
         // all sections must
         // - start at an address higher than `new_boundary`; this ensures the
         // stack won't collide into them
         // - end at an address lower or equal to the initial `stack_top`, as
         // this is likely the boundary of the RAM region
         for sh in elf.section_headers {
-            if failed {
-                break;
-            }
-
             if let Some(name) = elf.shdr_strtab.get(sh.sh_name).and_then(|res| res.ok()) {
                 if merged_sections.remove(name) {
                     let start = sh.sh_addr;
                     let end = start + sh.sh_size;
 
-                    if start < new_boundary || end > stack_top {
-                        failed = true;
+                    if start < new_boundary {
+                        // didn't properly merge sections in `get_boundaries`
+                        fatal_error = true;
+                        break;
                     }
-                }
 
-                // todo remove
-                if failed {
-                    panic!("{}", name);
+                    if end > stack_top {
+                        // internal alignment requirements pushed the sections
+                        // past the RAM boundary
+                        ok = false;
+
+                        // we need to shift the boundary lower
+                        new_boundary -= end - stack_top;
+                        continue 'link;
+                    }
                 }
             }
         }
 
-        if !merged_sections.is_empty() {
-            failed = true;
-        }
+        // a section disappeared in the second linker invocation
+        fatal_error |= !merged_sections.is_empty();
 
-        if failed {
-            // TODO remove the file because it's invalid
-            // let _ = fs::remove_file(output);
+        if fatal_error {
+            // remove the linked binary because it is invalid
+            let _ = fs::remove_file(output);
 
-            return Err(anyhow!("We are sorry. We couldn't make the linker do as we intended. Please file a bug report with steps to build this program so we can do better."));
+            // unexpected error
+            return Err(anyhow!(
+                "We are sorry.\
+We couldn't make the linker do as we intended.\
+Please file a bug report with steps to build this program so we can do better."
+            ));
         }
     }
 
@@ -143,7 +149,6 @@ fn get_o_value(args: &[String]) -> Result<&Path, Error> {
 
 /// Boundaries of the statically allocated memory
 struct Boundaries {
-    max_align: u64,
     merged_sections: HashSet<String>,
     address: u64,
     size: u64,
@@ -243,7 +248,6 @@ fn get_boundaries(path: &Path) -> Result<Boundaries, Error> {
         .ok_or_else(|| anyhow!("symbol `__stack_top__` not found"))?;
 
     Ok(Boundaries {
-        max_align,
         address: start,
         merged_sections,
         size: total_size,
